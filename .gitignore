@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 运行时生成的本地文件
+按键显示_配置.json
+按键显示_运行日志.log
+*.log
+
+# IDE
+.idea/
+.vscode/
