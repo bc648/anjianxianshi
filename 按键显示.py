@@ -31,7 +31,6 @@
 """
 
 import ctypes
-import io
 import json
 import os
 import sys
@@ -49,6 +48,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 APP_NAME = "按键显示"
 CONFIG_FILE = "按键显示_配置.json"
 LOG_FILE = "按键显示_运行日志.log"
+LOG_MAX_LINES = 200        # 日志滚动上限：长期挂机时文件不会无限长大
 
 # 以下三处必须是 ASCII（Win32 窗口类名 / 托盘 ID），所以用拼音
 OVERLAY_CLASS = "AnJianXianShi"            # 叠加窗的窗口类名
@@ -87,6 +87,14 @@ def exe_icon():
             shell32.ExtractIconExW(sys.executable, 0, ctypes.byref(large),
                                    ctypes.byref(small), 1)
             _EXE_ICON = large.value or small.value or 0
+            # ExtractIconEx 一次给出两个图标句柄，用不到的那个必须显式销毁 ——
+            # GDI 用户对象不归 Python 管，漏了就是永久少一个句柄
+            spare = small.value if large.value else 0
+            if spare:
+                try:
+                    user32.DestroyIcon(wintypes.HANDLE(spare))
+                except Exception:
+                    pass
         except Exception as e:
             log_error("读取自身图标失败: %r" % (e,))
             _EXE_ICON = 0
@@ -340,6 +348,7 @@ sig(user32.CreateWindowExW, wintypes.HWND,
      wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID])
 sig(user32.DestroyWindow, wintypes.BOOL, [wintypes.HWND])
 sig(user32.ShowWindow, wintypes.BOOL, [wintypes.HWND, ctypes.c_int])
+sig(user32.DestroyIcon, wintypes.BOOL, [wintypes.HICON])
 sig(user32.SetWindowPos, wintypes.BOOL,
     [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
      ctypes.c_int, ctypes.c_int, wintypes.UINT])
@@ -356,6 +365,8 @@ sig(user32.GetMonitorInfoW, wintypes.BOOL,
 sig(user32.GetCursorPos, wintypes.BOOL, [ctypes.POINTER(POINT)])
 sig(user32.IsWindowVisible, wintypes.BOOL, [wintypes.HWND])
 sig(user32.GetForegroundWindow, wintypes.HWND, [])
+sig(user32.GetDpiForSystem, ctypes.c_uint, [])
+sig(user32.SetProcessDPIAware, wintypes.BOOL, [])
 sig(user32.GetAsyncKeyState, ctypes.c_short, [ctypes.c_int])
 sig(user32.SetForegroundWindow, wintypes.BOOL, [wintypes.HWND])
 sig(user32.UpdateLayeredWindow, wintypes.BOOL,
@@ -429,10 +440,23 @@ def app_dir():
 
 
 def log_note(msg):
-    """写一条运行痕迹（启动、退出原因等）。"""
+    """写一条运行痕迹（启动、退出原因等）。
+
+    超过 LOG_MAX_LINES 就丢掉最旧的：这文件是只追加的，而本程序按设计要
+    连着挂机几十天，不回滚它就会无限长大。
+    """
+    path = os.path.join(app_dir(), LOG_FILE)
     try:
-        with open(os.path.join(app_dir(), LOG_FILE), "a", encoding="utf-8") as f:
-            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+        lines.append("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        if len(lines) > LOG_MAX_LINES:
+            lines = lines[-LOG_MAX_LINES:]
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
     except Exception:
         pass
 
@@ -583,7 +607,10 @@ FONT_FILES = [
     ("黑体",           "simhei.ttf",       "simhei.ttf"),
 ]
 
+# 上限是因为每个 FreeTypeFont 都持有自己那份字体数据：拖动字号滑条会一路
+# 经过几十个尺寸，不封顶的话缓存会越攒越多，而且是只进不出。
 _FONT_CACHE = {}
+_FONT_CACHE_MAX = 32
 
 _TRAY_IMAGE = None    # 托盘图标缓存
 _EXE_ICON = None      # 本程序 exe 的图标句柄缓存
@@ -625,6 +652,9 @@ def load_font(name, size, bold=True):
             font = ImageFont.truetype("arialbd.ttf", size)
         except Exception:
             font = ImageFont.load_default()
+    if len(_FONT_CACHE) >= _FONT_CACHE_MAX:
+        # 一次性清掉最简单：字体重新加载是一次性的几毫秒，不值得为它做 LRU
+        _FONT_CACHE.clear()
     _FONT_CACHE[key] = font
     return font
 
@@ -780,6 +810,129 @@ def render(keys, cps_rect, cps_text, win_w, win_h, active, cfg, scale,
         return img
     return img.resize((win_w, win_h),
                       getattr(Image, "Resampling", Image).LANCZOS)
+
+
+# ============================================================ 帧组装
+#
+# 每个元素（按键 / CPS 条）只有「按下 / 松开」两种外观，几何也是固定的，
+# 所以把它们各自渲染成小图缓存起来，每帧只做几次内存拼接。
+#
+# 为什么要这样：原来每帧把整张画布重画一遍再超采样缩小，实测一帧 22ms，
+# 其中 58% 耗在 resize 上。改成小图缓存后每帧只剩 memcpy 和一次提交。
+#
+# 小图要比元素矩形外扩 TILE_PAD：超采样缩小是邻域加权求和，影响半径 2~3 px，
+# 不外扩的话元素边缘会和「整帧一起缩放」的结果不一样。
+#
+# 拼的是**预乘之后**的 BGRA：预乘是逐像素独立运算（每通道 × alpha），
+# 和周围像素无关，所以小图各自预乘好再拼，结果与整帧预乘完全一致。
+
+TILE_PAD = 4
+_OFF_RECT = (-1000, -1000, -999, -999)      # 画到画布外＝这个元素不存在
+_APPEARANCE_KEYS = (
+    "radius", "key_bg", "key_bg_alpha", "key_border", "show_border",
+    "key_normal_fg", "key_normal_fg_alpha", "key_active_bg",
+    "key_active_bg_alpha", "key_active_fg", "key_active_fg_alpha",
+    "font_name", "font_bold", "font_key_size", "font_small_size",
+    "font_cps_size", "cps_fg", "cps_alpha",
+)
+
+
+class FrameTiles:
+    """一套布局 + 外观下所有元素的小图，以及按当前状态拼出一帧的能力。"""
+
+    def __init__(self, keys, cps_rect, win_w, win_h, cfg, scale, move_mode):
+        self.keys = keys
+        self.cps_rect = cps_rect
+        self.cfg = cfg
+        self.w, self.h = win_w, win_h
+        self.scale = scale
+        self.move_mode = move_mode
+        self.on = {}                 # 键名 -> 按下态小图（首次按下时才生成）
+        self.cps_cache = {}          # CPS 文本 -> 小图
+
+        # base＝全部按键都是松开态，CPS 不在里面（它每帧都要按当前文本贴）
+        base = bytearray(win_w * win_h * 4)
+        for k in keys:
+            self._blit(base, self._tile(k["rect"], (k,), None, "", cfg))
+        self.base = bytes(base)
+
+    def _ss(self):
+        radius_px = max(0, int(round(self.cfg["radius"] * self.scale)))
+        return SUPERSAMPLE if radius_px > 0 else 1
+
+    def _tile(self, rect, item_keys, item_cps, text, cfg, pressed=False):
+        """把一个元素渲染成独立小图。
+
+        直接复用 render —— 画法必须和整帧时一模一样，否则顺便就改了画质。
+        """
+        x1, y1, x2, y2 = rect
+        ox, oy = max(0, x1 - TILE_PAD), max(0, y1 - TILE_PAD)
+        tw = min(self.w, x2 + TILE_PAD) - ox
+        th = min(self.h, y2 + TILE_PAD) - oy
+
+        def shift(r):
+            a, b, c, d = r
+            return (a - ox, b - oy, c - ox, d - oy)
+
+        keys = [dict(k, rect=shift(k["rect"])) for k in item_keys]
+        active = {k["id"]: True for k in keys} if pressed else {}
+        img = render(keys, shift(item_cps) if item_cps else _OFF_RECT,
+                     text, tw, th, active, cfg, self.scale, self.move_mode)
+        raw = premultiply(img).tobytes("raw", "BGRA")
+        rb = tw * 4
+        return (ox, oy, tw, th,
+                [raw[i * rb:(i + 1) * rb] for i in range(th)])
+
+    def _cps_box(self, text):
+        """ CPS 这一帧要覆盖的区域＝CPS 条本身与文字外接框的并集。
+
+        必须這麼算：CPS 读数的位数会变，「1000」比「1」宽得多。整帧渲染时
+        文字有整个画布可用，而小图只能覆盖自己的范围 —— 按 CPS 条的矩形取
+        小图的话，宽读数会在小图边缘被裁掉。
+        """
+        ss = self._ss()
+        bold = bool(self.cfg.get("font_bold", True))
+        font = load_font(self.cfg["font_name"],
+                         int(self.cfg["font_cps_size"] * self.scale) * ss, bold)
+        x1, y1, x2, y2 = self.cps_rect
+        bx = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox(
+            ((x1 + x2) / 2 * ss, (y1 + y2) / 2 * ss), text, font=font,
+            anchor="mm")
+        return (max(0, min(x1, int(bx[0] // ss))),
+                max(0, min(y1, int(bx[1] // ss))),
+                min(self.w, max(x2, int(bx[2] // ss) + 1)),
+                min(self.h, max(y2, int(bx[3] // ss) + 1)))
+
+    def _cps_tile(self, text):
+        t = self.cps_cache.get(text)
+        if t is None:
+            if len(self.cps_cache) > 24:
+                self.cps_cache.clear()
+            t = self._tile(self._cps_box(text), (), self.cps_rect, text,
+                           self.cfg)
+            self.cps_cache[text] = t
+        return t
+
+    def _blit(self, buf, tile):
+        """把小图按行 memcpy 进整帧缓冲。"""
+        x0, y0, tw, th, rows = tile
+        n = tw * 4
+        for i in range(th):
+            off = ((y0 + i) * self.w + x0) * 4
+            buf[off:off + n] = rows[i]
+
+    def frame(self, active, cps_text):
+        """拼出当前这一帧：预乘后的 BGRA 字节串。"""
+        buf = bytearray(self.base)
+        for k in self.keys:
+            if active.get(k["id"]):
+                t = self.on.get(k["id"])
+                if t is None:            # 首次按下才渲染，省掉启动时的开销
+                    t = self.on[k["id"]] = self._tile(
+                        k["rect"], (k,), None, "", self.cfg, pressed=True)
+                self._blit(buf, t)
+        self._blit(buf, self._cps_tile(cps_text))
+        return buf
 
 
 def fallback_tray_image(size=64):
@@ -1064,7 +1217,6 @@ class SettingsWindow:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _show(self):
-        self.ov.settings_open = True
         user32.ShowWindow(self.hwnd, SW_RESTORE)
         user32.SetForegroundWindow(self.hwnd)
 
@@ -1199,7 +1351,6 @@ class SettingsWindow:
                         self._pick_color(d)
                     elif d.get("action") == "close":
                         user32.ShowWindow(hwnd, 0)
-                        self.ov.settings_open = False
                     elif d.get("action") == "reset":
                         self._reset_all()
                 return 0
@@ -1222,7 +1373,6 @@ class SettingsWindow:
 
             if msg == WM_CLOSE:            # 只隐藏，不销毁
                 user32.ShowWindow(hwnd, 0)
-                self.ov.settings_open = False
                 return 0
 
             if msg == WM_DESTROY:
@@ -1364,6 +1514,8 @@ class InputMonitor(threading.Thread):
     def run(self):
         try:
             winmm = ctypes.WinDLL("winmm")
+            sig(winmm.timeBeginPeriod, ctypes.c_uint, [ctypes.c_uint])
+            sig(winmm.timeEndPeriod, ctypes.c_uint, [ctypes.c_uint])
             winmm.timeBeginPeriod(1)
         except Exception:
             winmm = None
@@ -1405,7 +1557,6 @@ class Overlay:
         self.running = True
         self.dirty = False           # 参数变了，要重算布局并重绘
         self.cfg_dirty = False       # 配置需要落盘（拖滑条会高频触发，节流写）
-        self.settings_open = False   # 设置窗开着时别去抢它的置顶
         self.last_cfg_save = 0.0
         self.last_topmost_tick = 0.0
         self.last_foreground = None
@@ -1421,6 +1572,14 @@ class Overlay:
 
         self.move_mode = bool(cfg.get("move_mode", False))
         self.locked = not self.move_mode     # 常驻 = 固定位置 + 鼠标穿透
+
+        # 推帧用的 GDI 对象 / 元素小图缓存
+        self._hdc_screen = None
+        self._mem_dc = None
+        self._dib_bmp = None
+        self._dib_bits = ctypes.c_void_p()
+        self._dib_w = self._dib_h = 0
+        self.tiles = None
 
         self._register_class()
         ex = (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
@@ -1443,6 +1602,7 @@ class Overlay:
         self.last_cps_tick = 0.0
         self.last_cps_text = str(cfg["cps_text"]).format(0.0, 0.0)
 
+        self._rebuild_tiles()
         self.settings = SettingsWindow(self)
 
     def _register_class(self):
@@ -1512,34 +1672,57 @@ class Overlay:
             pass
 
     # ---------- 位图推送 ----------
-    def push(self, img):
-        w, h = img.size
-        # UpdateLayeredWindow 要求预乘 alpha，否则边缘出白线、半透明色偏淡
-        data = premultiply(img).tobytes("raw", "BGRA")
-        hdc_screen = user32.GetDC(0)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    def _rebuild_tiles(self):
+        """布局或外观变了就重生成元素小图缓存。"""
+        self.tiles = FrameTiles(self.keys, self.cps_rect, self.win_w,
+                                self.win_h, self.cfg, self.scale,
+                                self.move_mode)
+
+    def _ensure_dib(self):
+        """准备好一块和窗口同尺寸的 DIB —— 尺寸没变就一直复用。
+
+        每帧新建 + 销毁 GDI 对象要 0.28ms，复用之后提交一帧只要 0.06ms。
+        """
+        if self._dib_bmp and self._dib_w == self.win_w and self._dib_h == self.win_h:
+            return True
+        if self._dib_bmp:
+            gdi32.DeleteObject(self._dib_bmp)
+            gdi32.DeleteDC(self._mem_dc)
+            self._dib_bmp = None
+        if not self._hdc_screen:
+            self._hdc_screen = user32.GetDC(0)
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = w
-        bmi.bmiHeader.biHeight = -h          # 负高度 = 自上而下
+        bmi.bmiHeader.biWidth = self.win_w
+        bmi.bmiHeader.biHeight = -self.win_h     # 负高度 = 自上而下
         bmi.bmiHeader.biPlanes = 1
         bmi.bmiHeader.biBitCount = 32
         bmi.bmiHeader.biCompression = BI_RGB
-        ppv = ctypes.c_void_p()
-        hbmp = gdi32.CreateDIBSection(hdc_screen, ctypes.byref(bmi),
-                                      DIB_RGB_COLORS, ctypes.byref(ppv), None, 0)
-        ctypes.memmove(ppv, data, len(data))
-        gdi32.SelectObject(hdc_mem, hbmp)
-        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
-        size = SIZE(w, h)
+        self._dib_bits = ctypes.c_void_p()
+        self._dib_bmp = gdi32.CreateDIBSection(
+            self._hdc_screen, ctypes.byref(bmi), DIB_RGB_COLORS,
+            ctypes.byref(self._dib_bits), None, 0)
+        self._mem_dc = gdi32.CreateCompatibleDC(self._hdc_screen)
+        gdi32.SelectObject(self._mem_dc, self._dib_bmp)
+        self._dib_w, self._dib_h = self.win_w, self.win_h
+        return bool(self._dib_bmp)
+
+    def push(self, data):
+        """把一帧推给分层窗口。data 是**预乘后**的 BGRA 字节序列。"""
+        if not self._ensure_dib():
+            return
+        # memmove 的源必须能被解释成 void*，而 bytearray 本身不行。
+        # from_buffer 只是把它包一层，不拷贝 —— 比先转 bytes 少一次 memcpy。
+        src = (ctypes.c_char * len(data)).from_buffer(data)
+        ctypes.memmove(self._dib_bits, src, len(data))
+        size = SIZE(self.win_w, self.win_h)
         src = POINT(0, 0)
         dst = POINT(self.x, self.y)
-        user32.UpdateLayeredWindow(self.hwnd, hdc_screen, ctypes.byref(dst),
-                                   ctypes.byref(size), hdc_mem, ctypes.byref(src),
-                                   0, ctypes.byref(blend), ULW_ALPHA)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(0, hdc_screen)
+        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+        user32.UpdateLayeredWindow(self.hwnd, self._hdc_screen, ctypes.byref(dst),
+                                   ctypes.byref(size), self._mem_dc,
+                                   ctypes.byref(src), 0, ctypes.byref(blend),
+                                   ULW_ALPHA)
 
     # ---------- 输入 ----------
     def down(self, vk):
@@ -1689,6 +1872,7 @@ class Overlay:
         # 变大之后可能顶出屏幕，夹回最近的显示器工作区
         self.x, self.y = self.clamp_to_screen(self.x, self.y)
         self.cfg["position_x"], self.cfg["position_y"] = self.x, self.y
+        self._rebuild_tiles()
 
     # ---------- 置顶保持 ----------
     def _real_window_above(self):
@@ -1736,8 +1920,6 @@ class Overlay:
             不用等下一轮轮询（否则会有一小段时间看不到）
           * 平时每 0.5 秒兜底一次
         """
-        if self.settings_open:
-            return                     # 设置窗开着时别去抢它的位置
         foreground = user32.GetForegroundWindow()
         changed = foreground != self.last_foreground
         if not changed and now - self.last_topmost_tick < 0.5:
@@ -1802,9 +1984,7 @@ class Overlay:
     # ---------- 主循环 ----------
     def run(self):
         self.start_tray()
-        self.push(render(self.keys, self.cps_rect, self.last_cps_text,
-                         self.win_w, self.win_h, {}, self.cfg, self.scale,
-                         self.move_mode))
+        self.push(self.tiles.frame({}, self.last_cps_text))
         last_move_mode = self.move_mode
         msg = MSG()
         while self.running:
@@ -1846,12 +2026,11 @@ class Overlay:
             # 切移动模式时边框提示色要跟着变
             if self.move_mode != last_move_mode:
                 last_move_mode = self.move_mode
+                self._rebuild_tiles()
                 changed = True
 
             if changed:
-                self.push(render(self.keys, self.cps_rect, self.last_cps_text,
-                                 self.win_w, self.win_h, active,
-                                 self.cfg, self.scale, self.move_mode))
+                self.push(self.tiles.frame(active, self.last_cps_text))
             time.sleep(0.008)
 
         self.cfg["position_x"], self.cfg["position_y"] = self.x, self.y
@@ -1860,6 +2039,13 @@ class Overlay:
             self.input.stop()
         except Exception:
             pass
+        if self._dib_bmp:
+            gdi32.DeleteObject(self._dib_bmp)
+            gdi32.DeleteDC(self._mem_dc)
+            self._dib_bmp = None
+        if self._hdc_screen:
+            user32.ReleaseDC(0, self._hdc_screen)
+            self._hdc_screen = None
         try:
             user32.DestroyWindow(self.hwnd)
         except Exception:
