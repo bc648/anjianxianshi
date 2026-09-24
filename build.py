@@ -27,6 +27,8 @@ def main():
         "--onefile",
         "--noconsole",
         "--exclude-module", "numpy",   # 用不到，排除后体积小 12 MB
+        # 不用 UPX：加壳会显著增加安全软件（火绒等）的误报风险，
+        # 省下的体积不值得。体积大头是 Python 运行时 + Pillow，常规排除无效。
         "--name", "按键显示",
         *icon_args,
         SCRIPT,
